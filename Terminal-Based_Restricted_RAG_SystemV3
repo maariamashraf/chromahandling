@@ -1,0 +1,1059 @@
+#!/usr/bin/env python3
+"""
+Terminal-Based Restricted RAG System
+ChromaDB + LLaMA 3 with customizable restrictions via command line
+"""
+
+import chromadb
+from sentence_transformers import SentenceTransformer
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import re
+import json
+import os
+import sys
+import argparse
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+import yaml
+from pathlib import Path
+import colorama
+from colorama import Fore, Back, Style
+import readline  # For better input handling
+
+# Initialize colorama for cross-platform colored output
+colorama.init(autoreset=True)
+
+class TerminalRestrictedRAG:
+    def __init__(self, config_file: str = None):
+        self.config_file = config_file
+        self.chroma_client = None
+        self.collection = None
+        self.embedding_model = None
+        self.tokenizer = None
+        self.model = None
+        
+        # Default configuration
+        self.config = {
+            'database': {
+                'chroma_db_path': './terminal_chroma_db',
+                'collection_name': 'terminal_documents',
+                'embedding_model': 'all-MiniLM-L6-v2'
+            },
+            'model': {
+                'llama_model_path': 'meta-llama/Llama-3-8b-chat-hf',
+                'max_new_tokens': 256,
+                'temperature': 0.7,
+                'device': 'auto'
+            },
+            'restrictions': {
+                'max_response_length': 200,
+                'min_similarity_threshold': 0.5,
+                'allowed_topics': [],
+                'blocked_keywords': ['confidential', 'private', 'secret'],
+                'require_context_match': True,
+                'block_external_knowledge': False,
+                'allowed_domains': [],
+                'response_format': 'default',
+                'max_context_chunks': 3,
+                'politeness_required': True,
+                'cite_sources': True,
+                'business_hours_only': False,
+                'user_role_restrictions': {}
+            },
+            'terminal': {
+                'colored_output': True,
+                'show_context_preview': True,
+                'auto_save_config': True,
+                'log_queries': True,
+                'prompt_style': 'detailed'  # 'simple', 'detailed', 'minimal'
+            }
+        }
+        
+        self.audit_log = []
+        self.current_user_role = 'user'
+        
+        # Load config if provided
+        if config_file and os.path.exists(config_file):
+            self.load_config(config_file)
+
+    def print_colored(self, text: str, color: str = 'white', style: str = None):
+        """Print colored text if terminal colors are enabled"""
+        if not self.config['terminal']['colored_output']:
+            print(text)
+            return
+            
+        color_map = {
+            'red': Fore.RED,
+            'green': Fore.GREEN,
+            'yellow': Fore.YELLOW,
+            'blue': Fore.BLUE,
+            'magenta': Fore.MAGENTA,
+            'cyan': Fore.CYAN,
+            'white': Fore.WHITE,
+            'bright_red': Fore.LIGHTRED_EX,
+            'bright_green': Fore.LIGHTGREEN_EX,
+            'bright_yellow': Fore.LIGHTYELLOW_EX,
+            'bright_blue': Fore.LIGHTBLUE_EX
+        }
+        
+        style_map = {
+            'bold': Style.BRIGHT,
+            'dim': Style.DIM
+        }
+        
+        color_code = color_map.get(color, Fore.WHITE)
+        style_code = style_map.get(style, '') if style else ''
+        
+        print(f"{color_code}{style_code}{text}")
+
+    def load_config(self, config_file: str):
+        """Load configuration from YAML file"""
+        try:
+            with open(config_file, 'r') as f:
+                loaded_config = yaml.safe_load(f)
+                # Deep merge with default config
+                self._deep_merge_dict(self.config, loaded_config)
+            self.print_colored(f"✅ Configuration loaded from {config_file}", 'green')
+        except Exception as e:
+            self.print_colored(f"⚠️  Error loading config: {e}", 'yellow')
+
+    def save_config(self, config_file: str = None):
+        """Save current configuration to YAML file"""
+        if not config_file:
+            config_file = self.config_file or './rag_config.yaml'
+        
+        try:
+            with open(config_file, 'w') as f:
+                yaml.dump(self.config, f, default_flow_style=False, indent=2)
+            self.print_colored(f"💾 Configuration saved to {config_file}", 'green')
+        except Exception as e:
+            self.print_colored(f"❌ Error saving config: {e}", 'red')
+
+    def _deep_merge_dict(self, target: dict, source: dict):
+        """Deep merge two dictionaries"""
+        for key, value in source.items():
+            if key in target and isinstance(target[key], dict) and isinstance(value, dict):
+                self._deep_merge_dict(target[key], value)
+            else:
+                target[key] = value
+
+    def initialize_models(self):
+        """Initialize ChromaDB, embedding model, and LLaMA 3"""
+        try:
+            self.print_colored("🔄 Initializing models...", 'blue')
+            
+            # Initialize ChromaDB
+            self.chroma_client = chromadb.PersistentClient(
+                path=self.config['database']['chroma_db_path']
+            )
+            self.collection = self.chroma_client.get_or_create_collection(
+                name=self.config['database']['collection_name'],
+                metadata={"hnsw:space": "cosine"}
+            )
+            
+            # Initialize embedding model
+            self.embedding_model = SentenceTransformer(
+                self.config['database']['embedding_model']
+            )
+            
+            # Initialize LLaMA 3
+            model_path = self.config['model']['llama_model_path']
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                torch_dtype=torch.float16,
+                device_map=self.config['model']['device'],
+                low_cpu_mem_usage=True
+            )
+            
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+            self.print_colored("✅ All models initialized successfully!", 'green')
+            return True
+            
+        except Exception as e:
+            self.print_colored(f"❌ Error initializing models: {e}", 'red')
+            return False
+
+    def terminal_setup_wizard(self):
+        """Interactive setup wizard for first-time configuration"""
+        self.print_colored("🎯 RAG System Setup Wizard", 'cyan', 'bold')
+        self.print_colored("=" * 50, 'cyan')
+        
+        # Model configuration
+        self.print_colored("\n📁 Model Configuration:", 'yellow', 'bold')
+        llama_path = input(f"LLaMA model path [{self.config['model']['llama_model_path']}]: ").strip()
+        if llama_path:
+            self.config['model']['llama_model_path'] = llama_path
+        
+        embedding_model = input(f"Embedding model [{self.config['database']['embedding_model']}]: ").strip()
+        if embedding_model:
+            self.config['database']['embedding_model'] = embedding_model
+        
+        # Database configuration
+        self.print_colored("\n🗄️  Database Configuration:", 'yellow', 'bold')
+        db_path = input(f"ChromaDB path [{self.config['database']['chroma_db_path']}]: ").strip()
+        if db_path:
+            self.config['database']['chroma_db_path'] = db_path
+        
+        collection_name = input(f"Collection name [{self.config['database']['collection_name']}]: ").strip()
+        if collection_name:
+            self.config['database']['collection_name'] = collection_name
+        
+        # Restriction configuration
+        self.print_colored("\n🔒 Restriction Configuration:", 'yellow', 'bold')
+        
+        max_length = input(f"Max response length [{self.config['restrictions']['max_response_length']}]: ").strip()
+        if max_length.isdigit():
+            self.config['restrictions']['max_response_length'] = int(max_length)
+        
+        similarity_threshold = input(f"Min similarity threshold [{self.config['restrictions']['min_similarity_threshold']}]: ").strip()
+        if similarity_threshold.replace('.', '').isdigit():
+            self.config['restrictions']['min_similarity_threshold'] = float(similarity_threshold)
+        
+        blocked_keywords = input("Blocked keywords (comma-separated): ").strip()
+        if blocked_keywords:
+            self.config['restrictions']['blocked_keywords'] = [k.strip() for k in blocked_keywords.split(',')]
+        
+        require_context = input("Require context match? (y/n) [y]: ").strip().lower()
+        self.config['restrictions']['require_context_match'] = require_context != 'n'
+        
+        cite_sources = input("Require source citations? (y/n) [y]: ").strip().lower()
+        self.config['restrictions']['cite_sources'] = cite_sources != 'n'
+        
+        # Terminal preferences
+        self.print_colored("\n🖥️  Terminal Preferences:", 'yellow', 'bold')
+        colored_output = input("Use colored output? (y/n) [y]: ").strip().lower()
+        self.config['terminal']['colored_output'] = colored_output != 'n'
+        
+        show_context = input("Show context preview? (y/n) [y]: ").strip().lower()
+        self.config['terminal']['show_context_preview'] = show_context != 'n'
+        
+        # Save configuration
+        save_config = input("\n💾 Save this configuration? (y/n) [y]: ").strip().lower()
+        if save_config != 'n':
+            config_file = input("Config file name [rag_config.yaml]: ").strip() or "rag_config.yaml"
+            self.save_config(config_file)
+            self.config_file = config_file
+
+    def interactive_restriction_editor(self):
+        """Interactive editor for modifying restrictions"""
+        while True:
+            self.print_colored("\n🔧 Restriction Editor", 'cyan', 'bold')
+            self.print_colored("-" * 30, 'cyan')
+            
+            restrictions = self.config['restrictions']
+            for i, (key, value) in enumerate(restrictions.items(), 1):
+                self.print_colored(f"{i:2}. {key}: {value}", 'white')
+            
+            self.print_colored(f"{len(restrictions)+1:2}. Add user role restriction", 'yellow')
+            self.print_colored(f"{len(restrictions)+2:2}. Back to main menu", 'magenta')
+            
+            choice = input(f"\nSelect option (1-{len(restrictions)+2}): ").strip()
+            
+            if choice.isdigit():
+                choice_num = int(choice)
+                if choice_num == len(restrictions) + 2:
+                    break
+                elif choice_num == len(restrictions) + 1:
+                    self._add_user_role_restriction()
+                elif 1 <= choice_num <= len(restrictions):
+                    key = list(restrictions.keys())[choice_num - 1]
+                    self._edit_restriction(key, restrictions[key])
+
+    def _add_user_role_restriction(self):
+        """Add user role-based restrictions"""
+        role = input("Enter user role: ").strip()
+        if not role:
+            return
+        
+        blocked_patterns = input("Blocked query patterns (comma-separated regex): ").strip()
+        if blocked_patterns:
+            patterns = [p.strip() for p in blocked_patterns.split(',')]
+            if 'user_role_restrictions' not in self.config['restrictions']:
+                self.config['restrictions']['user_role_restrictions'] = {}
+            
+            self.config['restrictions']['user_role_restrictions'][role] = {
+                'blocked_queries': patterns
+            }
+            self.print_colored(f"✅ Added restrictions for role: {role}", 'green')
+
+    def _edit_restriction(self, key: str, current_value):
+        """Edit a specific restriction"""
+        self.print_colored(f"\nEditing: {key}", 'yellow', 'bold')
+        self.print_colored(f"Current value: {current_value}", 'white')
+        
+        if isinstance(current_value, bool):
+            new_value = input("New value (true/false): ").strip().lower()
+            if new_value in ['true', 'false']:
+                self.config['restrictions'][key] = new_value == 'true'
+        elif isinstance(current_value, int):
+            new_value = input("New value (integer): ").strip()
+            if new_value.isdigit():
+                self.config['restrictions'][key] = int(new_value)
+        elif isinstance(current_value, float):
+            new_value = input("New value (float): ").strip()
+            try:
+                self.config['restrictions'][key] = float(new_value)
+            except ValueError:
+                pass
+        elif isinstance(current_value, list):
+            new_value = input("New value (comma-separated): ").strip()
+            if new_value:
+                self.config['restrictions'][key] = [v.strip() for v in new_value.split(',')]
+        else:
+            new_value = input("New value: ").strip()
+            if new_value:
+                self.config['restrictions'][key] = new_value
+
+    def add_documents_from_terminal(self):
+        """Interactive document addition"""
+        self.print_colored("\n📚 Add Documents", 'cyan', 'bold')
+        
+        while True:
+            method = input("\nAdd documents by:\n1. File path\n2. Directory\n3. Direct text\n4. Back to menu\nChoice: ").strip()
+            
+            if method == '1':
+                self._add_single_file()
+            elif method == '2':
+                self._add_from_directory()
+            elif method == '3':
+                self._add_direct_text()
+            elif method == '4':
+                break
+
+    def _add_single_file(self):
+        """Add documents from a single file"""
+        file_path = input("Enter file path: ").strip()
+        if not os.path.exists(file_path):
+            self.print_colored("❌ File not found", 'red')
+            return
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Get metadata
+            domain = input("Document domain [general]: ").strip() or 'general'
+            topic = input("Document topic [general]: ").strip() or 'general'
+            
+            # Chunk and add document
+            chunks = self._chunk_text(content)
+            documents = chunks
+            metadatas = [{
+                'source': file_path,
+                'domain': domain,
+                'topic': topic,
+                'chunk_id': i,
+                'total_chunks': len(chunks)
+            } for i in range(len(chunks))]
+            
+            ids = [f"file_{hash(file_path)}_{i}" for i in range(len(chunks))]
+            
+            self._add_documents_to_db(documents, metadatas, ids)
+            self.print_colored(f"✅ Added {len(chunks)} chunks from {file_path}", 'green')
+            
+        except Exception as e:
+            self.print_colored(f"❌ Error reading file: {e}", 'red')
+
+    def _add_from_directory(self):
+        """Add all text files from a directory"""
+        dir_path = input("Enter directory path: ").strip()
+        if not os.path.isdir(dir_path):
+            self.print_colored("❌ Directory not found", 'red')
+            return
+        
+        extensions = input("File extensions (comma-separated) [.txt,.md,.py]: ").strip()
+        if not extensions:
+            extensions = '.txt,.md,.py'
+        
+        extensions = [ext.strip() for ext in extensions.split(',')]
+        
+        domain = input("Domain for all documents [general]: ").strip() or 'general'
+        
+        files_processed = 0
+        for root, dirs, files in os.walk(dir_path):
+            for file in files:
+                if any(file.lower().endswith(ext) for ext in extensions):
+                    file_path = os.path.join(root, file)
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                        
+                        chunks = self._chunk_text(content)
+                        metadatas = [{
+                            'source': file_path,
+                            'domain': domain,
+                            'topic': os.path.splitext(file)[0],
+                            'chunk_id': i,
+                            'total_chunks': len(chunks)
+                        } for i in range(len(chunks))]
+                        
+                        ids = [f"file_{hash(file_path)}_{i}" for i in range(len(chunks))]
+                        
+                        self._add_documents_to_db(chunks, metadatas, ids)
+                        files_processed += 1
+                        
+                    except Exception as e:
+                        self.print_colored(f"⚠️  Error processing {file_path}: {e}", 'yellow')
+        
+        self.print_colored(f"✅ Processed {files_processed} files from {dir_path}", 'green')
+
+    def _add_direct_text(self):
+        """Add document from direct text input"""
+        self.print_colored("Enter document text (Press Ctrl+D or Ctrl+Z when finished):", 'yellow')
+        
+        lines = []
+        try:
+            while True:
+                line = input()
+                lines.append(line)
+        except EOFError:
+            pass
+        
+        content = '\n'.join(lines)
+        if not content.strip():
+            self.print_colored("❌ No content provided", 'red')
+            return
+        
+        # Get metadata
+        source = input("\nDocument source name: ").strip() or 'direct_input'
+        domain = input("Document domain [general]: ").strip() or 'general'
+        topic = input("Document topic [general]: ").strip() or 'general'
+        
+        chunks = self._chunk_text(content)
+        metadatas = [{
+            'source': source,
+            'domain': domain,
+            'topic': topic,
+            'chunk_id': i,
+            'total_chunks': len(chunks)
+        } for i in range(len(chunks))]
+        
+        ids = [f"direct_{hash(source)}_{i}" for i in range(len(chunks))]
+        
+        self._add_documents_to_db(chunks, metadatas, ids)
+        self.print_colored(f"✅ Added {len(chunks)} chunks from direct input", 'green')
+
+    def _chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
+        """Split text into overlapping chunks"""
+        chunks = []
+        start = 0
+        
+        while start < len(text):
+            end = start + chunk_size
+            chunk = text[start:end]
+            chunks.append(chunk)
+            start = end - overlap
+        
+        return chunks
+
+    def _add_documents_to_db(self, documents: List[str], metadatas: List[Dict], ids: List[str]):
+        """Add documents to ChromaDB with filtering"""
+        if not self.collection:
+            self.print_colored("❌ Database not initialized", 'red')
+            return
+        
+        # Filter documents
+        filtered_docs = []
+        filtered_metadatas = []
+        filtered_ids = []
+        
+        for doc, metadata, doc_id in zip(documents, metadatas, ids):
+            if self._is_document_allowed(doc, metadata):
+                filtered_docs.append(doc)
+                filtered_metadatas.append(metadata)
+                filtered_ids.append(doc_id)
+        
+        if filtered_docs:
+            embeddings = self.embedding_model.encode(filtered_docs).tolist()
+            self.collection.add(
+                documents=filtered_docs,
+                embeddings=embeddings,
+                metadatas=filtered_metadatas,
+                ids=filtered_ids
+            )
+
+    def _is_document_allowed(self, document: str, metadata: Dict) -> bool:
+        """Check if document passes content filters"""
+        restrictions = self.config['restrictions']
+        
+        # Check blocked keywords
+        doc_lower = document.lower()
+        for keyword in restrictions['blocked_keywords']:
+            if keyword.lower() in doc_lower:
+                self.print_colored(f"⚠️  Document blocked due to keyword: {keyword}", 'yellow')
+                return False
+        
+        # Check allowed domains
+        if restrictions['allowed_domains']:
+            domain = metadata.get('domain', 'unknown')
+            if domain not in restrictions['allowed_domains']:
+                self.print_colored(f"⚠️  Document blocked due to domain: {domain}", 'yellow')
+                return False
+        
+        return True
+
+    def query_interactive(self):
+        """Interactive query interface"""
+        if not self.model:
+            self.print_colored("❌ Models not initialized. Run setup first.", 'red')
+            return
+        
+        self.print_colored("\n💬 Interactive Query Mode", 'cyan', 'bold')
+        self.print_colored("Type 'quit' to exit, 'role <name>' to change role", 'yellow')
+        self.print_colored(f"Current role: {self.current_user_role}", 'green')
+        self.print_colored("-" * 50, 'cyan')
+        
+        while True:
+            try:
+                if self.config['terminal']['prompt_style'] == 'minimal':
+                    prompt = "> "
+                elif self.config['terminal']['prompt_style'] == 'detailed':
+                    prompt = f"[{self.current_user_role}] Query: "
+                else:
+                    prompt = "You: "
+                
+                user_input = input(f"\n{prompt}").strip()
+                
+                if user_input.lower() == 'quit':
+                    break
+                elif user_input.lower().startswith('role '):
+                    new_role = user_input[5:].strip()
+                    if new_role:
+                        self.current_user_role = new_role
+                        self.print_colored(f"✅ Role changed to: {new_role}", 'green')
+                    continue
+                elif user_input.lower() == 'status':
+                    self._show_status()
+                    continue
+                elif user_input.lower() == 'help':
+                    self._show_help()
+                    continue
+                
+                if user_input:
+                    self._process_query(user_input)
+                    
+            except KeyboardInterrupt:
+                self.print_colored("\n\n👋 Goodbye!", 'cyan')
+                break
+            except EOFError:
+                break
+
+    def _process_query(self, query: str):
+        """Process a single query"""
+        self.print_colored("🤔 Processing...", 'blue')
+        
+        try:
+            result = self.generate_response(query, self.current_user_role)
+            
+            if result['restricted']:
+                self.print_colored("🚫 RESTRICTED RESPONSE", 'red', 'bold')
+                self.print_colored(f"Response: {result['response']}", 'red')
+                self.print_colored(f"Reasons: {', '.join(result['restriction_reasons'])}", 'yellow')
+                self.print_colored(f"Severity: {result['severity']}", 'yellow')
+            else:
+                self.print_colored("🤖 Assistant:", 'bright_green', 'bold')
+                self.print_colored(result['response'], 'white')
+                
+                # Show context if enabled
+                if (self.config['terminal']['show_context_preview'] and 
+                    result.get('context_used')):
+                    self.print_colored(f"\n📚 Context used ({len(result['context_used'])} sources):", 'cyan')
+                    for i, doc in enumerate(result['context_used'][:2], 1):  # Show first 2
+                        preview = doc['content'][:100] + "..." if len(doc['content']) > 100 else doc['content']
+                        source = doc['metadata'].get('source', 'Unknown')
+                        self.print_colored(f"  {i}. {source}: {preview}", 'dim')
+                
+        except Exception as e:
+            self.print_colored(f"❌ Error processing query: {e}", 'red')
+
+    def _show_status(self):
+        """Show system status"""
+        self.print_colored("\n📊 System Status", 'cyan', 'bold')
+        self.print_colored("-" * 20, 'cyan')
+        
+        # Document count
+        if self.collection:
+            count = self.collection.count()
+            self.print_colored(f"Documents in database: {count}", 'white')
+        else:
+            self.print_colored("Database: Not initialized", 'red')
+        
+        # Current restrictions
+        restrictions = self.config['restrictions']
+        active_restrictions = [k for k, v in restrictions.items() if v not in [False, [], None, '']]
+        self.print_colored(f"Active restrictions: {len(active_restrictions)}", 'white')
+        
+        # Current role
+        self.print_colored(f"Current user role: {self.current_user_role}", 'white')
+        
+        # Query log count
+        self.print_colored(f"Queries logged: {len(self.audit_log)}", 'white')
+
+    def _show_help(self):
+        """Show help information"""
+        self.print_colored("\n❓ Available Commands", 'cyan', 'bold')
+        self.print_colored("-" * 20, 'cyan')
+        self.print_colored("quit                 - Exit the program", 'white')
+        self.print_colored("role <name>          - Change user role", 'white')
+        self.print_colored("status               - Show system status", 'white')
+        self.print_colored("help                 - Show this help", 'white')
+        self.print_colored("<any text>           - Ask a question", 'white')
+
+    def generate_response(self, query: str, user_role: str = 'user'):
+        """Generate response with all restrictions applied"""
+        # Implementation similar to previous version but adapted for terminal use
+        # (This would include all the restriction logic from the previous code)
+        
+        # Simplified version for brevity - include full logic from previous artifact
+        restrictions = self.config['restrictions']
+        
+        # Check query restrictions
+        query_lower = query.lower()
+        for keyword in restrictions['blocked_keywords']:
+            if keyword.lower() in query_lower:
+                return {
+                    'response': f"Query blocked due to keyword: {keyword}",
+                    'restricted': True,
+                    'restriction_reasons': [f'Contains blocked keyword: {keyword}'],
+                    'severity': 'high'
+                }
+        
+        # Retrieve context
+        context_docs = self._retrieve_context(query)
+        
+        if restrictions['require_context_match'] and not context_docs:
+            return {
+                'response': "I don't have enough relevant information to answer your question.",
+                'restricted': True,
+                'restriction_reasons': ['No relevant context found'],
+                'severity': 'low'
+            }
+        
+        # Generate response (simplified for example)
+        response = f"Based on {len(context_docs)} sources: This is a placeholder response that would normally come from LLaMA 3."
+        
+        # Apply response formatting
+        words = response.split()
+        if len(words) > restrictions['max_response_length']:
+            response = ' '.join(words[:restrictions['max_response_length']]) + "..."
+        
+        if restrictions['cite_sources'] and context_docs:
+            sources = set(doc['metadata'].get('source', 'Unknown') for doc in context_docs)
+            response += f"\n\nSources: {', '.join(sources)}"
+        
+        return {
+            'response': response,
+            'context_used': context_docs,
+            'restricted': False
+        }
+
+    def _retrieve_context(self, query: str) -> List[Dict]:
+        """Retrieve context from ChromaDB"""
+        if not self.collection:
+            return []
+        
+        try:
+            query_embedding = self.embedding_model.encode([query]).tolist()
+            restrictions = self.config['restrictions']
+            
+            results = self.collection.query(
+                query_embeddings=query_embedding,
+                n_results=restrictions['max_context_chunks'],
+                include=["documents", "metadatas", "distances"]
+            )
+            
+            context_docs = []
+            for i in range(len(results['documents'][0])):
+                similarity = 1 - results['distances'][0][i]
+                
+                if similarity >= restrictions['min_similarity_threshold']:
+                    context_docs.append({
+                        'content': results['documents'][0][i],
+                        'metadata': results['metadatas'][0][i],
+                        'similarity': similarity
+                    })
+            
+            return context_docs
+        except Exception as e:
+            self.print_colored(f"⚠️  Error retrieving context: {e}", 'yellow')
+            return []
+
+    def main_menu(self):
+        """Main terminal interface"""
+        self.print_colored("🚀 Terminal Restricted RAG System", 'bright_blue', 'bold')
+        self.print_colored("=" * 50, 'bright_blue')
+        
+        while True:
+            self.print_colored("\n📋 Main Menu:", 'cyan', 'bold')
+            options = [
+                "1. Setup/Initialize System",
+                "2. Add Documents", 
+                "3. Configure Restrictions",
+                "4. Start Query Session",
+                "5. View Configuration",
+                "6. Save Configuration",
+                "7. Load Configuration",
+                "8. System Status",
+                "9. Exit"
+            ]
+            
+            for option in options:
+                self.print_colored(option, 'white')
+            
+            choice = input(f"\n🎯 Select option (1-{len(options)}): ").strip()
+            
+            if choice == '1':
+                if not self.initialize_models():
+                    self.terminal_setup_wizard()
+                    if not self.initialize_models():
+                        self.print_colored("❌ Failed to initialize system", 'red')
+            elif choice == '2':
+                if not self.collection:
+                    self.print_colored("❌ Initialize system first", 'red')
+                else:
+                    self.add_documents_from_terminal()
+            elif choice == '3':
+                self.interactive_restriction_editor()
+            elif choice == '4':
+                self.query_interactive()
+            elif choice == '5':
+                self._show_configuration()
+            elif choice == '6':
+                config_file = input("Config file name [rag_config.yaml]: ").strip() or "rag_config.yaml"
+                self.save_config(config_file)
+            elif choice == '7':
+                config_file = input("Config file to load: ").strip()
+                if config_file:
+                    self.load_config(config_file)
+            elif choice == '8':
+                self._show_status()
+            elif choice == '9':
+                self.print_colored("\n👋 Thank you for using Terminal RAG System!", 'cyan')
+                if self.config['terminal']['auto_save_config'] and self.config_file:
+                    self.save_config()
+                    self.print_colored("💾 Configuration auto-saved", 'green')
+                break
+            else:
+                self.print_colored("❌ Invalid option. Please try again.", 'red')
+
+    def _show_configuration(self):
+        """Display current configuration in a formatted way"""
+        self.print_colored("\n⚙️  Current Configuration", 'cyan', 'bold')
+        self.print_colored("=" * 40, 'cyan')
+        
+        # Database settings
+        self.print_colored("\n📁 Database Settings:", 'yellow', 'bold')
+        db_config = self.config['database']
+        for key, value in db_config.items():
+            self.print_colored(f"  {key}: {value}", 'white')
+        
+        # Model settings
+        self.print_colored("\n🤖 Model Settings:", 'yellow', 'bold')
+        model_config = self.config['model']
+        for key, value in model_config.items():
+            self.print_colored(f"  {key}: {value}", 'white')
+        
+        # Restrictions
+        self.print_colored("\n🔒 Active Restrictions:", 'yellow', 'bold')
+        restrictions = self.config['restrictions']
+        for key, value in restrictions.items():
+            if value not in [False, [], None, '']:
+                color = 'bright_red' if isinstance(value, list) and value else 'white'
+                self.print_colored(f"  {key}: {value}", color)
+        
+        # Terminal settings
+        self.print_colored("\n🖥️  Terminal Settings:", 'yellow', 'bold')
+        terminal_config = self.config['terminal']
+        for key, value in terminal_config.items():
+            self.print_colored(f"  {key}: {value}", 'white')
+
+    def generate_response(self, query: str, user_role: str = 'user'):
+        """Complete response generation with LLaMA 3"""
+        # Log the query
+        self.audit_log.append({
+            'timestamp': datetime.now().isoformat(),
+            'query': query,
+            'user_role': user_role
+        })
+        
+        restrictions = self.config['restrictions']
+        
+        # Check query restrictions
+        query_check = self._check_query_restrictions(query, user_role)
+        if not query_check['allowed']:
+            return {
+                'response': f"Query blocked: {', '.join(query_check['reasons'])}",
+                'restricted': True,
+                'restriction_reasons': query_check['reasons'],
+                'severity': query_check['severity']
+            }
+        
+        # Retrieve context
+        context_docs = self._retrieve_context(query)
+        
+        # Check if we have sufficient context
+        if restrictions['require_context_match'] and not context_docs:
+            return {
+                'response': "I don't have enough relevant information in my knowledge base to answer your question accurately.",
+                'restricted': True,
+                'restriction_reasons': ['No relevant context found'],
+                'severity': 'low'
+            }
+        
+        # Build context
+        if context_docs:
+            context_text = "\n\n".join([
+                f"Source: {doc['metadata'].get('source', 'Unknown')}\nContent: {doc['content']}"
+                for doc in context_docs
+            ])
+        else:
+            context_text = "No specific context available."
+        
+        # Create prompt
+        system_instructions = """You are a helpful but restricted assistant. Follow these rules:
+1. Only answer based on the provided context
+2. Be concise and accurate
+3. If information isn't in the context, say so clearly
+4. Be polite and professional
+5. Do not speculate or make up information"""
+        
+        if restrictions['block_external_knowledge']:
+            system_instructions += "\n6. NEVER use knowledge outside the provided context"
+        
+        prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+{system_instructions}
+
+Context:
+{context_text}
+
+<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+{query}
+
+<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+"""
+        
+        try:
+            # Generate response with LLaMA 3
+            inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=3000)
+            
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    inputs.input_ids.to(self.model.device),
+                    attention_mask=inputs.attention_mask.to(self.model.device),
+                    max_new_tokens=self.config['model']['max_new_tokens'],
+                    temperature=self.config['model']['temperature'],
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id
+                )
+            
+            full_response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            
+            # Extract assistant response
+            assistant_start = full_response.find("<|start_header_id|>assistant<|end_header_id|>")
+            if assistant_start != -1:
+                raw_response = full_response[assistant_start + len("<|start_header_id|>assistant<|end_header_id|>"):].strip()
+            else:
+                raw_response = full_response.split(prompt)[-1].strip()
+            
+        except Exception as e:
+            return {
+                'response': f"Error generating response: {e}",
+                'restricted': True,
+                'restriction_reasons': ['Generation error'],
+                'severity': 'high'
+            }
+        
+        # Apply response formatting restrictions
+        formatted_response = self._format_response(raw_response, context_docs)
+        
+        # Final content filter
+        response_lower = formatted_response.lower()
+        for blocked in restrictions['blocked_keywords']:
+            if blocked.lower() in response_lower:
+                return {
+                    'response': "Response blocked due to content restrictions.",
+                    'restricted': True,
+                    'restriction_reasons': ['Response contains blocked content'],
+                    'severity': 'high'
+                }
+        
+        return {
+            'response': formatted_response,
+            'context_used': context_docs,
+            'restricted': False,
+            'restrictions_applied': list(restrictions.keys()),
+            'audit_id': len(self.audit_log) - 1
+        }
+
+    def _check_query_restrictions(self, query: str, user_role: str) -> Dict[str, Any]:
+        """Check if query passes restrictions"""
+        restrictions_passed = {
+            'allowed': True,
+            'reasons': [],
+            'severity': 'info'
+        }
+        
+        restrictions = self.config['restrictions']
+        query_lower = query.lower()
+        
+        # Check blocked keywords
+        for keyword in restrictions['blocked_keywords']:
+            if keyword.lower() in query_lower:
+                restrictions_passed['allowed'] = False
+                restrictions_passed['reasons'].append(f"Contains blocked keyword: {keyword}")
+                restrictions_passed['severity'] = 'high'
+        
+        # Check business hours
+        if restrictions['business_hours_only']:
+            current_hour = datetime.now().hour
+            if current_hour < 9 or current_hour > 17:
+                restrictions_passed['allowed'] = False
+                restrictions_passed['reasons'].append("Outside business hours (9 AM - 5 PM)")
+                restrictions_passed['severity'] = 'medium'
+        
+        # Check user role restrictions
+        if user_role in restrictions['user_role_restrictions']:
+            role_restrictions = restrictions['user_role_restrictions'][user_role]
+            if 'blocked_queries' in role_restrictions:
+                for blocked_pattern in role_restrictions['blocked_queries']:
+                    if re.search(blocked_pattern.lower(), query_lower):
+                        restrictions_passed['allowed'] = False
+                        restrictions_passed['reasons'].append(f"Query not allowed for role: {user_role}")
+                        restrictions_passed['severity'] = 'high'
+        
+        return restrictions_passed
+
+    def _format_response(self, response: str, context_docs: List[Dict]) -> str:
+        """Format response according to restrictions"""
+        restrictions = self.config['restrictions']
+        
+        # Limit response length
+        words = response.split()
+        if len(words) > restrictions['max_response_length']:
+            response = ' '.join(words[:restrictions['max_response_length']]) + "..."
+        
+        # Add politeness if required
+        if restrictions['politeness_required']:
+            polite_words = ['please', 'thank', 'welcome', 'glad', 'happy']
+            if not any(polite in response.lower() for polite in polite_words):
+                response = "I'm happy to help. " + response
+        
+        # Add source citations if required
+        if restrictions['cite_sources'] and context_docs:
+            sources = set()
+            for doc in context_docs:
+                source = doc['metadata'].get('source', 'Unknown')
+                sources.add(source)
+            
+            if sources:
+                citations = ', '.join(list(sources)[:3])  # Limit to 3 sources
+                response += f"\n\n📚 Sources: {citations}"
+        
+        # Format according to specified format
+        if restrictions['response_format'] == 'json':
+            return json.dumps({
+                'answer': response,
+                'confidence': sum(doc['similarity'] for doc in context_docs) / len(context_docs) if context_docs else 0,
+                'sources_count': len(context_docs)
+            }, indent=2)
+        elif restrictions['response_format'] == 'bullet':
+            lines = [line.strip() for line in response.split('.') if line.strip()]
+            return '\n• ' + '\n• '.join(lines)
+        
+        return response
+
+
+def main():
+    """Main entry point with command line argument parsing"""
+    parser = argparse.ArgumentParser(description='Terminal-Based Restricted RAG System')
+    parser.add_argument('--config', '-c', type=str, help='Configuration file path')
+    parser.add_argument('--setup', '-s', action='store_true', help='Run setup wizard')
+    parser.add_argument('--query', '-q', type=str, help='Single query mode')
+    parser.add_argument('--role', '-r', type=str, default='user', help='User role for query')
+    parser.add_argument('--no-color', action='store_true', help='Disable colored output')
+    parser.add_argument('--batch-file', '-b', type=str, help='File containing queries to process in batch')
+    
+    args = parser.parse_args()
+    
+    # Initialize system
+    rag_system = TerminalRestrictedRAG(config_file=args.config)
+    
+    # Disable colors if requested
+    if args.no_color:
+        rag_system.config['terminal']['colored_output'] = False
+    
+    # Set user role
+    rag_system.current_user_role = args.role
+    
+    try:
+        # Handle different modes
+        if args.setup:
+            rag_system.terminal_setup_wizard()
+            if not rag_system.initialize_models():
+                rag_system.print_colored("❌ Failed to initialize system", 'red')
+                return 1
+                
+        elif args.query:
+            # Single query mode
+            if not rag_system.initialize_models():
+                rag_system.print_colored("❌ Failed to initialize system", 'red')
+                return 1
+                
+            result = rag_system.generate_response(args.query, args.role)
+            if result['restricted']:
+                rag_system.print_colored(f"RESTRICTED: {result['response']}", 'red')
+                return 2
+            else:
+                rag_system.print_colored(result['response'], 'white')
+                return 0
+                
+        elif args.batch_file:
+            # Batch processing mode
+            if not rag_system.initialize_models():
+                rag_system.print_colored("❌ Failed to initialize system", 'red')
+                return 1
+                
+            try:
+                with open(args.batch_file, 'r') as f:
+                    queries = [line.strip() for line in f if line.strip()]
+                
+                rag_system.print_colored(f"Processing {len(queries)} queries from {args.batch_file}", 'blue')
+                
+                for i, query in enumerate(queries, 1):
+                    rag_system.print_colored(f"\n--- Query {i}/{len(queries)} ---", 'cyan')
+                    rag_system.print_colored(f"Q: {query}", 'yellow')
+                    
+                    result = rag_system.generate_response(query, args.role)
+                    if result['restricted']:
+                        rag_system.print_colored(f"RESTRICTED: {result['response']}", 'red')
+                    else:
+                        rag_system.print_colored(f"A: {result['response']}", 'white')
+                        
+            except FileNotFoundError:
+                rag_system.print_colored(f"❌ Batch file not found: {args.batch_file}", 'red')
+                return 1
+                
+        else:
+            # Interactive mode (default)
+            rag_system.main_menu()
+            
+    except KeyboardInterrupt:
+        rag_system.print_colored("\n\n👋 Interrupted by user. Goodbye!", 'cyan')
+        return 0
+    except Exception as e:
+        rag_system.print_colored(f"❌ Unexpected error: {e}", 'red')
+        return 1
+    
+    return 0
+
+
+if __name__ == "__main__":
+    exit(main())
